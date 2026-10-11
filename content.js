@@ -2,8 +2,9 @@
 // Clean, native, high-performance image converter with real format detection & SVG support
 
 (function () {
-  if (window.__fliprInjected) return;
-  window.__fliprInjected = true;
+  const FLIPR_KEY = Symbol.for("__flipr_injected__");
+  if (window[FLIPR_KEY]) return;
+  window[FLIPR_KEY] = true;
 
   // ─── Detect Actual Image Format from Magic Bytes & MIME ───────────────────
 
@@ -466,7 +467,7 @@
       <div id="flipr-modal" role="dialog" aria-modal="true" aria-label="flipr.exe">
         <div id="flipr-header">
           <div id="flipr-header-icon">
-            <img src="${iconUrl}" alt="icon" onerror="this.parentElement.textContent='⚡'"/>
+            <img alt="icon"/>
           </div>
           <div id="flipr-header-title">
             <h2>flipr.exe</h2>
@@ -514,9 +515,9 @@
                 <span>WEBP</span>
                 <span class="flipr-fmt-sub">Modern</span>
               </button>
-              <button class="flipr-fmt-btn" data-format="svg">
+              <button class="flipr-fmt-btn" data-format="svg" title="Embeds raster image inside an SVG container — not true vector tracing">
                 <span>SVG</span>
-                <span class="flipr-fmt-sub">Vector</span>
+                <span class="flipr-fmt-sub">Raster Wrap</span>
               </button>
               <button class="flipr-fmt-btn" data-format="bmp">
                 <span>BMP</span>
@@ -556,6 +557,20 @@
         </div>
       </div>
     `;
+
+    // Set icon src via DOM to avoid interpolated values in HTML template
+    const iconImg = overlay.querySelector("#flipr-header-icon img");
+    if (iconImg) {
+      if (iconUrl) {
+        iconImg.src = iconUrl;
+        iconImg.addEventListener("error", function () {
+          this.parentElement.textContent = "⚡";
+        });
+      } else {
+        iconImg.parentElement.textContent = "⚡";
+      }
+    }
+
     return overlay;
   }
 
@@ -589,6 +604,7 @@
     let imgElement = null;
     let fetchedBlob = null;
     let detectedSource = null;
+    let createdObjectUrl = null;
 
     // Helper: format bytes nicely
     function formatBytes(bytes) {
@@ -597,6 +613,16 @@
       const sizes = ["B", "KB", "MB"];
       const i = Math.floor(Math.log(bytes) / Math.log(k));
       return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
+    }
+
+    // ── Sanitize filename for safe download ──
+    function sanitizeFilename(name) {
+      return name
+        .replace(/\.\./g, "_")
+        .replace(/[\/\\:*?"<>|]/g, "_")
+        .replace(/^\.+/, "_")
+        .replace(/\s+/g, "_")
+        .substring(0, 100) || "image";
     }
 
     // ── Generate clean default filename ──
@@ -618,8 +644,39 @@
       if (type) status.classList.add(type);
     }
 
+    const onKey = (e) => {
+      if (e.key === "Escape") {
+        closeModal();
+      }
+    };
+    document.addEventListener("keydown", onKey);
+
     function closeModal() {
+      document.removeEventListener("keydown", onKey);
+      if (createdObjectUrl) {
+        URL.revokeObjectURL(createdObjectUrl);
+        createdObjectUrl = null;
+      }
       overlay.remove();
+    }
+
+    // Fetch actual payload bytes — try direct CORS, fallback to background fetch
+    async function fetchImageBytes(url) {
+      try {
+        const resp = await fetch(url, { mode: "cors" });
+        if (resp.ok) return await resp.blob();
+      } catch {}
+      // Fallback: route through background service worker (bypasses CORS)
+      try {
+        const result = await new Promise((resolve) => {
+          chrome.runtime.sendMessage({ action: "fetchImageData", url }, resolve);
+        });
+        if (result && result.success && result.dataUrl) {
+          const resp = await fetch(result.dataUrl);
+          return await resp.blob();
+        }
+      } catch {}
+      return null;
     }
 
     // ── Fetch image to detect ACTUAL FORMAT & prepare conversion ──
@@ -640,49 +697,44 @@
       };
       img.src = imageUrl;
 
-      // 2. Fetch the actual payload bytes to inspect magic bytes & headers
-      try {
-        const resp = await fetch(imageUrl, { mode: "cors" });
-        if (resp.ok) {
-          fetchedBlob = await resp.blob();
-          if (fetchedBlob.size) {
-            filesizeEl.textContent = formatBytes(fetchedBlob.size);
-          }
+      fetchedBlob = await fetchImageBytes(imageUrl);
 
-          // Read first 32 bytes for magic byte detection
-          const headSlice = fetchedBlob.slice(0, 32);
-          const buffer = await headSlice.arrayBuffer();
-          const uint8 = new Uint8Array(buffer);
-          const detected = identifyBytesFormat(uint8);
+      if (fetchedBlob) {
+        if (fetchedBlob.size) {
+          filesizeEl.textContent = formatBytes(fetchedBlob.size);
+        }
 
-          if (detected) {
-            detectedSource = detected;
-            actualFmtTag.textContent = detected.format;
-          } else if (fetchedBlob.type) {
-            const mimeShort = fetchedBlob.type.replace("image/", "").toUpperCase();
-            actualFmtTag.textContent = mimeShort || "UNKNOWN";
-          } else {
-            fallbackUrlDetection();
-          }
+        // Read first 32 bytes for magic byte detection
+        const headSlice = fetchedBlob.slice(0, 32);
+        const buffer = await headSlice.arrayBuffer();
+        const uint8 = new Uint8Array(buffer);
+        const detected = identifyBytesFormat(uint8);
 
-          // If Image element errored due to CORS, use blob URL for preview
-          if (!imgElement) {
-            const objectUrl = URL.createObjectURL(fetchedBlob);
-            const fallbackImg = new Image();
-            fallbackImg.onload = () => {
-              imgElement = fallbackImg;
-              preview.src = objectUrl;
-              preview.style.display = "block";
-              previewLoading.style.display = "none";
-              dimensionsEl.textContent = `${fallbackImg.naturalWidth} × ${fallbackImg.naturalHeight}`;
-              saveBtn.disabled = false;
-            };
-            fallbackImg.src = objectUrl;
-          }
+        if (detected) {
+          detectedSource = detected;
+          actualFmtTag.textContent = detected.format;
+        } else if (fetchedBlob.type) {
+          const mimeShort = fetchedBlob.type.replace("image/", "").toUpperCase();
+          actualFmtTag.textContent = mimeShort || "UNKNOWN";
         } else {
           fallbackUrlDetection();
         }
-      } catch (e) {
+
+        // If Image element errored due to CORS, use blob URL for preview
+        if (!imgElement) {
+          createdObjectUrl = URL.createObjectURL(fetchedBlob);
+          const fallbackImg = new Image();
+          fallbackImg.onload = () => {
+            imgElement = fallbackImg;
+            preview.src = createdObjectUrl;
+            preview.style.display = "block";
+            previewLoading.style.display = "none";
+            dimensionsEl.textContent = `${fallbackImg.naturalWidth} × ${fallbackImg.naturalHeight}`;
+            saveBtn.disabled = false;
+          };
+          fallbackImg.src = createdObjectUrl;
+        }
+      } else {
         fallbackUrlDetection();
       }
     }
@@ -729,7 +781,7 @@
       setStatus("Processing image conversion…", "loading");
 
       const quality = parseInt(qualitySlider.value, 10) / 100;
-      const rawName = filenameInput.value.trim() || "image";
+      const rawName = sanitizeFilename(filenameInput.value.trim() || "image");
       const ext = selectedFormat === "jpeg" ? "jpg" : selectedFormat;
       const filename = rawName.replace(/\.[^.]+$/, "") + "." + ext;
 
@@ -739,6 +791,12 @@
         // Ensure we have image dimensions & bitmap
         let width = imgElement ? (imgElement.naturalWidth || imgElement.width) : 0;
         let height = imgElement ? (imgElement.naturalHeight || imgElement.height) : 0;
+
+        // Guard against extremely large images that could crash the tab
+        const megapixels = (width * height) / 1_000_000;
+        if (megapixels > 100) {
+          throw new Error(`Image too large (${Math.round(megapixels)}MP). Max supported: 100MP.`);
+        }
 
         let canvas = document.createElement("canvas");
         let ctx = null;
@@ -755,13 +813,18 @@
         } else {
           // Fetch blob fallback
           if (!fetchedBlob) {
-            const resp = await fetch(imageUrl, { mode: "cors" });
-            if (!resp.ok) throw new Error("Could not fetch image data");
-            fetchedBlob = await resp.blob();
+            fetchedBlob = await fetchImageBytes(imageUrl);
+            if (!fetchedBlob) throw new Error("Could not fetch image data");
           }
           const bitmap = await createImageBitmap(fetchedBlob);
           width = bitmap.width;
           height = bitmap.height;
+
+          const bmpMegapixels = (width * height) / 1_000_000;
+          if (bmpMegapixels > 100) {
+            throw new Error(`Image too large (${Math.round(bmpMegapixels)}MP). Max supported: 100MP.`);
+          }
+
           canvas.width = width;
           canvas.height = height;
           ctx = canvas.getContext("2d");
@@ -772,13 +835,20 @@
           ctx.drawImage(bitmap, 0, 0);
         }
 
-        // ── Handle SVG Format ──
+        // ── Handle SVG Format (raster wrapper, not true vectorization) ──
         if (selectedFormat === "svg") {
-          // Wrap high-resolution raster inside a clean standalone SVG container
-          const pngData = canvas.toDataURL("image/png");
+          const pngBlob = await new Promise((resolve, reject) => {
+            canvas.toBlob(b => b ? resolve(b) : reject(new Error("PNG conversion failed for SVG wrapper")), "image/png");
+          });
+          const pngDataUrl = await new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result);
+            reader.onerror = () => reject(new Error("Failed to encode PNG for SVG"));
+            reader.readAsDataURL(pngBlob);
+          });
           const svgContent = `<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
-  <image width="${width}" height="${height}" xlink:href="${pngData}" href="${pngData}"/>
+  <image width="${width}" height="${height}" xlink:href="${pngDataUrl}" href="${pngDataUrl}"/>
 </svg>`;
           dataUrl = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svgContent);
         } else {
@@ -791,7 +861,27 @@
             gif: "image/gif"
           };
           const mime = mimeMap[selectedFormat] || "image/png";
-          dataUrl = canvas.toDataURL(mime, quality);
+
+          // Use toBlob for better memory handling than toDataURL
+          const blob = await new Promise((resolve, reject) => {
+            canvas.toBlob(
+              b => b ? resolve(b) : reject(new Error("Image conversion failed — canvas may be too large")),
+              mime,
+              quality
+            );
+          });
+
+          // Validate output size before encoding
+          if (blob.size > 200 * 1024 * 1024) {
+            throw new Error("Output file too large (" + formatBytes(blob.size) + "). Try reducing quality or using a smaller image.");
+          }
+
+          dataUrl = await new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result);
+            reader.onerror = () => reject(new Error("Failed to encode converted image"));
+            reader.readAsDataURL(blob);
+          });
         }
 
         setStatus("Opening Chrome save dialog…", "loading");
@@ -824,14 +914,6 @@
     overlay.addEventListener("click", (e) => {
       if (e.target === overlay) closeModal();
     });
-
-    const onKey = (e) => {
-      if (e.key === "Escape") {
-        closeModal();
-        document.removeEventListener("keydown", onKey);
-      }
-    };
-    document.addEventListener("keydown", onKey);
   }
 
   // ─── Listen for Background Messages ───────────────────────────────────────

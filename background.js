@@ -61,12 +61,57 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
 
 // Listen for download requests from content script
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // Fetch image data from background to bypass CORS restrictions on content scripts
+  if (message.action === "fetchImageData") {
+    if (typeof message.url !== "string" || !/^(https?|data|blob):/i.test(message.url)) {
+      sendResponse({ success: false, error: "Invalid image URL" });
+      return false;
+    }
+
+    fetch(message.url)
+      .then(async (resp) => {
+        if (!resp.ok) throw new Error("HTTP " + resp.status);
+        const blob = await resp.blob();
+        const reader = new FileReader();
+        reader.onloadend = () => {
+          sendResponse({
+            success: true,
+            dataUrl: reader.result,
+            size: blob.size,
+            type: blob.type,
+          });
+        };
+        reader.onerror = () => {
+          sendResponse({ success: false, error: "Failed to read image data" });
+        };
+        reader.readAsDataURL(blob);
+      })
+      .catch((err) => {
+        sendResponse({ success: false, error: err.message });
+      });
+    return true; // Keep channel open for async response
+  }
+
   if (message.action === "downloadImage") {
     const { dataUrl, filename } = message;
+
+    if (typeof dataUrl !== "string" || !/^(data:|blob:)/i.test(dataUrl)) {
+      sendResponse({ success: false, error: "Invalid data URL" });
+      return false;
+    }
+
+    // Sanitize filename on the background side (defense-in-depth against path traversal)
+    const safeFilename = (typeof filename === "string" ? filename : "image.png")
+      .replace(/\.\./g, "_")
+      .replace(/[\/\\:*?"<>|]/g, "_")
+      .replace(/^\.+/, "_")
+      .trim()
+      .substring(0, 100) || "image.png";
+
     chrome.downloads.download(
       {
         url: dataUrl,
-        filename: filename,
+        filename: safeFilename,
         saveAs: true,
       },
       (downloadId) => {
